@@ -57,6 +57,10 @@ static const char* installed_roots_path =
     INSTALL_PREFIX "/share/grpc/roots.pem";
 #endif
 
+#ifndef TSI_OPENSSL_ALPN_SUPPORT
+#define TSI_OPENSSL_ALPN_SUPPORT 1
+#endif
+
 /* -- Overridden default roots. -- */
 
 static grpc_ssl_roots_override_callback ssl_roots_override_cb = nullptr;
@@ -620,6 +624,7 @@ typedef struct {
   tsi_ssl_client_handshaker_factory* client_handshaker_factory;
   char* target_name;
   char* overridden_target_name;
+  const verify_peer_options* verify_options;
 } grpc_ssl_channel_security_connector;
 
 typedef struct {
@@ -849,7 +854,8 @@ grpc_auth_context* grpc_ssl_peer_to_auth_context(const tsi_peer* peer) {
 static grpc_error* ssl_check_peer(grpc_security_connector* sc,
                                   const char* peer_name, const tsi_peer* peer,
                                   grpc_auth_context** auth_context) {
-  /* Check the ALPN. */
+#if TSI_OPENSSL_ALPN_SUPPORT
+  /* Check the ALPN if ALPN is supported. */
   const tsi_peer_property* p =
       tsi_peer_get_property_by_name(peer, TSI_SSL_ALPN_SELECTED_PROTOCOL);
   if (p == nullptr) {
@@ -860,7 +866,7 @@ static grpc_error* ssl_check_peer(grpc_security_connector* sc,
     return GRPC_ERROR_CREATE_FROM_STATIC_STRING(
         "Cannot check peer: invalid ALPN value.");
   }
-
+#endif /* TSI_OPENSSL_ALPN_SUPPORT */
   /* Check the peer name if specified. */
   if (peer_name != nullptr && !grpc_ssl_host_matches_name(peer, peer_name)) {
     char* msg;
@@ -878,11 +884,34 @@ static void ssl_channel_check_peer(grpc_security_connector* sc, tsi_peer peer,
                                    grpc_closure* on_peer_checked) {
   grpc_ssl_channel_security_connector* c =
       reinterpret_cast<grpc_ssl_channel_security_connector*>(sc);
-  grpc_error* error = ssl_check_peer(sc,
-                                     c->overridden_target_name != nullptr
-                                         ? c->overridden_target_name
-                                         : c->target_name,
-                                     &peer, auth_context);
+  const char* target_name = c->overridden_target_name != nullptr
+                                ? c->overridden_target_name
+                                : c->target_name;
+  grpc_error* error = ssl_check_peer(sc, target_name, &peer, auth_context);
+  if (error == GRPC_ERROR_NONE &&
+      c->verify_options->verify_peer_callback != nullptr) {
+    const tsi_peer_property* p =
+        tsi_peer_get_property_by_name(&peer, TSI_X509_PEM_CERT_PROPERTY);
+    if (p == nullptr) {
+      error = GRPC_ERROR_CREATE_FROM_STATIC_STRING(
+          "Cannot check peer: missing pem cert property.");
+    } else {
+      char* peer_pem = static_cast<char*>(gpr_malloc(p->value.length + 1));
+      memcpy(peer_pem, p->value.data, p->value.length);
+      peer_pem[p->value.length] = '\0';
+      int callback_status = c->verify_options->verify_peer_callback(
+          target_name, peer_pem,
+          c->verify_options->verify_peer_callback_userdata);
+      gpr_free(peer_pem);
+      if (callback_status) {
+        char* msg;
+        gpr_asprintf(&msg, "Verify peer callback returned a failure (%d)",
+                     callback_status);
+        error = GRPC_ERROR_CREATE_FROM_COPIED_STRING(msg);
+        gpr_free(msg);
+      }
+    }
+  }
   GRPC_CLOSURE_SCHED(on_peer_checked, error);
   tsi_peer_destruct(&peer);
 }
@@ -1047,6 +1076,7 @@ grpc_security_status grpc_ssl_channel_security_connector_create(
   if (overridden_target_name != nullptr) {
     c->overridden_target_name = gpr_strdup(overridden_target_name);
   }
+  c->verify_options = &config->verify_options;
 
   has_key_cert_pair = config->pem_key_cert_pair != nullptr &&
                       config->pem_key_cert_pair->private_key != nullptr &&

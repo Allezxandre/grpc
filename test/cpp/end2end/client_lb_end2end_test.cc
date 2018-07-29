@@ -198,7 +198,8 @@ class ClientLbEnd2endTest : public ::testing::Test {
 
   bool SendRpc(
       const std::unique_ptr<grpc::testing::EchoTestService::Stub>& stub,
-      EchoResponse* response = nullptr, int timeout_ms = 1000) {
+      EchoResponse* response = nullptr, int timeout_ms = 1000,
+      Status* result = nullptr) {
     const bool local_response = (response == nullptr);
     if (local_response) response = new EchoResponse;
     EchoRequest request;
@@ -206,6 +207,7 @@ class ClientLbEnd2endTest : public ::testing::Test {
     ClientContext context;
     context.set_deadline(grpc_timeout_milliseconds_to_deadline(timeout_ms));
     Status status = stub->Echo(&context, request, response);
+    if (result != nullptr) *result = status;
     if (local_response) delete response;
     return status.ok();
   }
@@ -214,12 +216,15 @@ class ClientLbEnd2endTest : public ::testing::Test {
       const std::unique_ptr<grpc::testing::EchoTestService::Stub>& stub,
       const grpc_core::DebugLocation& location) {
     EchoResponse response;
-    const bool success = SendRpc(stub, &response);
-    if (!success) abort();
-    ASSERT_TRUE(success) << "From " << location.file() << ":"
-                         << location.line();
+    Status status;
+    const bool success = SendRpc(stub, &response, 2000, &status);
+    ASSERT_TRUE(success) << "From " << location.file() << ":" << location.line()
+                         << "\n"
+                         << "Error: " << status.error_message() << " "
+                         << status.error_details();
     ASSERT_EQ(response.message(), kRequestMessage_)
         << "From " << location.file() << ":" << location.line();
+    if (!success) abort();
   }
 
   void CheckRpcSendFailure(
@@ -274,9 +279,14 @@ class ClientLbEnd2endTest : public ::testing::Test {
 
   void WaitForServer(
       const std::unique_ptr<grpc::testing::EchoTestService::Stub>& stub,
-      size_t server_idx, const grpc_core::DebugLocation& location) {
+      size_t server_idx, const grpc_core::DebugLocation& location,
+      bool ignore_failure = false) {
     do {
-      CheckRpcSendOk(stub, location);
+      if (ignore_failure) {
+        SendRpc(stub);
+      } else {
+        CheckRpcSendOk(stub, location);
+      }
     } while (servers_[server_idx]->service_.request_count() == 0);
     ResetCounters();
   }
@@ -362,7 +372,7 @@ TEST_F(ClientLbEnd2endTest, PickFirstBackOffInitialReconnect) {
       grpc_timeout_milliseconds_to_deadline(kInitialBackOffMs * 2)));
   const gpr_timespec t1 = gpr_now(GPR_CLOCK_MONOTONIC);
   const grpc_millis waited_ms = gpr_time_to_millis(gpr_time_sub(t1, t0));
-  gpr_log(GPR_DEBUG, "Waited %ld milliseconds", waited_ms);
+  gpr_log(GPR_DEBUG, "Waited %" PRId64 " milliseconds", waited_ms);
   // We should have waited at least kInitialBackOffMs. We substract one to
   // account for test and precision accuracy drift.
   EXPECT_GE(waited_ms, kInitialBackOffMs - 1);
@@ -391,7 +401,7 @@ TEST_F(ClientLbEnd2endTest, PickFirstBackOffMinReconnect) {
       grpc_timeout_milliseconds_to_deadline(kMinReconnectBackOffMs * 2));
   const gpr_timespec t1 = gpr_now(GPR_CLOCK_MONOTONIC);
   const grpc_millis waited_ms = gpr_time_to_millis(gpr_time_sub(t1, t0));
-  gpr_log(GPR_DEBUG, "Waited %ld ms", waited_ms);
+  gpr_log(GPR_DEBUG, "Waited %" PRId64 " ms", waited_ms);
   // We should have waited at least kMinReconnectBackOffMs. We substract one to
   // account for test and precision accuracy drift.
   EXPECT_GE(waited_ms, kMinReconnectBackOffMs - 1);
@@ -502,6 +512,37 @@ TEST_F(ClientLbEnd2endTest, PickFirstManyUpdates) {
   EXPECT_EQ("pick_first", channel->GetLoadBalancingPolicyName());
 }
 
+TEST_F(ClientLbEnd2endTest, PickFirstReresolutionNoSelected) {
+  // Prepare the ports for up servers and down servers.
+  const int kNumServers = 3;
+  const int kNumAliveServers = 1;
+  StartServers(kNumAliveServers);
+  std::vector<int> alive_ports, dead_ports;
+  for (size_t i = 0; i < kNumServers; ++i) {
+    if (i < kNumAliveServers) {
+      alive_ports.emplace_back(servers_[i]->port_);
+    } else {
+      dead_ports.emplace_back(grpc_pick_unused_port_or_die());
+    }
+  }
+  auto channel = BuildChannel("pick_first");
+  auto stub = BuildStub(channel);
+  // The initial resolution only contains dead ports. There won't be any
+  // selected subchannel. Re-resolution will return the same result.
+  SetNextResolution(dead_ports);
+  gpr_log(GPR_INFO, "****** INITIAL RESOLUTION SET *******");
+  for (size_t i = 0; i < 10; ++i) CheckRpcSendFailure(stub);
+  // Set a re-resolution result that contains reachable ports, so that the
+  // pick_first LB policy can recover soon.
+  SetNextResolutionUponError(alive_ports);
+  gpr_log(GPR_INFO, "****** RE-RESOLUTION SET *******");
+  WaitForServer(stub, 0, DEBUG_LOCATION, true /* ignore_failure */);
+  CheckRpcSendOk(stub, DEBUG_LOCATION);
+  EXPECT_EQ(servers_[0]->service_.request_count(), 1);
+  // Check LB policy name for the channel.
+  EXPECT_EQ("pick_first", channel->GetLoadBalancingPolicyName());
+}
+
 TEST_F(ClientLbEnd2endTest, RoundRobin) {
   // Start servers and send one RPC per server.
   const int kNumServers = 3;
@@ -532,6 +573,23 @@ TEST_F(ClientLbEnd2endTest, RoundRobin) {
   EXPECT_EQ(expected, connection_order);
   // Check LB policy name for the channel.
   EXPECT_EQ("round_robin", channel->GetLoadBalancingPolicyName());
+}
+
+TEST_F(ClientLbEnd2endTest, RoundRobinProcessPending) {
+  StartServers(1);  // Single server
+  auto channel = BuildChannel("round_robin");
+  auto stub = BuildStub(channel);
+  SetNextResolution({servers_[0]->port_});
+  WaitForServer(stub, 0, DEBUG_LOCATION);
+  // Create a new channel and its corresponding RR LB policy, which will pick
+  // the subchannels in READY state from the previous RPC against the same
+  // target (even if it happened over a different channel, because subchannels
+  // are globally reused). Progress should happen without any transition from
+  // this READY state.
+  auto second_channel = BuildChannel("round_robin");
+  auto second_stub = BuildStub(second_channel);
+  SetNextResolution({servers_[0]->port_});
+  CheckRpcSendOk(second_stub, DEBUG_LOCATION);
 }
 
 TEST_F(ClientLbEnd2endTest, RoundRobinUpdates) {
@@ -681,9 +739,11 @@ TEST_F(ClientLbEnd2endTest, RoundRobinReresolve) {
   const int kNumServers = 3;
   std::vector<int> first_ports;
   std::vector<int> second_ports;
+  first_ports.reserve(kNumServers);
   for (int i = 0; i < kNumServers; ++i) {
     first_ports.push_back(grpc_pick_unused_port_or_die());
   }
+  second_ports.reserve(kNumServers);
   for (int i = 0; i < kNumServers; ++i) {
     second_ports.push_back(grpc_pick_unused_port_or_die());
   }

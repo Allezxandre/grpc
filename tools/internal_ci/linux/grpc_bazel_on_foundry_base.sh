@@ -22,8 +22,8 @@ mkdir -p ${KOKORO_KEYSTORE_DIR}
 cp ${KOKORO_GFILE_DIR}/GrpcTesting-d0eeee2db331.json ${KOKORO_KEYSTORE_DIR}/4321_grpc-testing-service
 
 temp_dir=$(mktemp -d)
-ln -f "${KOKORO_GFILE_DIR}/bazel-release-0.12.0" ${temp_dir}/bazel
-chmod 755 "${KOKORO_GFILE_DIR}/bazel-release-0.12.0"
+ln -f "${KOKORO_GFILE_DIR}/bazel-rc-0.14.0rc5" ${temp_dir}/bazel
+chmod 755 "${KOKORO_GFILE_DIR}/bazel-rc-0.14.0rc5"
 export PATH="${temp_dir}:${PATH}"
 # This should show ${temp_dir}/bazel
 which bazel
@@ -49,9 +49,13 @@ source tools/internal_ci/helper_scripts/prepare_build_linux_rc
   --strategy=Closure=remote  \
   --genrule_strategy=remote  \
   --experimental_strict_action_env=true \
-  --experimental_remote_platform_override='properties:{name:"container-image" value:"docker://gcr.io/cloud-marketplace/google/rbe-debian8@sha256:1ede2a929b44d629ec5abe86eee6d7ffea1d5a4d247489a8867d46cfde3e38bd" }' \
-  --crosstool_top=@com_github_bazelbuild_bazeltoolchains//configs/debian8_clang/0.3.0/bazel_0.10.0:toolchain \
+  --crosstool_top=@com_github_bazelbuild_bazeltoolchains//configs/ubuntu16_04_clang/1.0/bazel_0.13.0/default:toolchain \
   --define GRPC_PORT_ISOLATED_RUNTIME=1 \
+  --action_env=BAZEL_DO_NOT_DETECT_CPP_TOOLCHAIN=1 \
+  --extra_toolchains=@com_github_bazelbuild_bazeltoolchains//configs/ubuntu16_04_clang/1.0/bazel_0.13.0/cpp:cc-toolchain-clang-x86_64-default \
+  --extra_execution_platforms=//third_party/toolchains:rbe_ubuntu1604 \
+  --host_platform=//third_party/toolchains:rbe_ubuntu1604 \
+  --platforms=//third_party/toolchains:rbe_ubuntu1604 \
   $1 \
   -- //test/... || FAILED="true"
 

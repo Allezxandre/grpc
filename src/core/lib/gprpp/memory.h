@@ -31,12 +31,12 @@
 // protected destructor.
 #define GPRC_ALLOW_CLASS_TO_USE_NON_PUBLIC_DELETE \
   template <typename T>                           \
-  friend void Delete(T*);
+  friend void grpc_core::Delete(T*);
 // Add this to a class that want to use New(), but has a private or
 // protected constructor.
 #define GPRC_ALLOW_CLASS_TO_USE_NON_PUBLIC_NEW \
   template <typename T, typename... Args>      \
-  friend T* New(Args&&...);
+  friend T* grpc_core::New(Args&&...);
 
 namespace grpc_core {
 
@@ -55,6 +55,7 @@ inline T* New(Args&&... args) {
 // Alternative to delete, since we cannot use it (for fear of libstdc++)
 template <typename T>
 inline void Delete(T* p) {
+  if (p == nullptr) return;
   p->~T();
   if (alignof(T) > kAlignmentForDefaultAllocationInBytes) {
     gpr_free_aligned(p);

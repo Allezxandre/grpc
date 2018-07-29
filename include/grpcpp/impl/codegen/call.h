@@ -171,8 +171,8 @@ class WriteOptions {
     return *this;
   }
 
-  /// Guarantee that all bytes have been written to the wire before completing
-  /// this write (usually writes are completed when they pass flow control)
+  /// Guarantee that all bytes have been written to the socket before completing
+  /// this write (usually writes are completed when they pass flow control).
   inline WriteOptions& set_write_through() {
     SetBit(GRPC_WRITE_THROUGH);
     return *this;
@@ -573,10 +573,13 @@ class CallOpClientRecvStatus {
       binary_error_details =
           grpc::string(iter->second.begin(), iter->second.length());
     }
-    *recv_status_ = Status(static_cast<StatusCode>(status_code_),
-                           grpc::string(GRPC_SLICE_START_PTR(error_message_),
-                                        GRPC_SLICE_END_PTR(error_message_)),
-                           binary_error_details);
+    *recv_status_ =
+        Status(static_cast<StatusCode>(status_code_),
+               GRPC_SLICE_IS_EMPTY(error_message_)
+                   ? grpc::string()
+                   : grpc::string(GRPC_SLICE_START_PTR(error_message_),
+                                  GRPC_SLICE_END_PTR(error_message_)),
+               binary_error_details);
     client_context_->set_debug_error_string(
         debug_error_string_ != nullptr ? debug_error_string_ : "");
     g_core_codegen_interface->grpc_slice_unref(error_message_);

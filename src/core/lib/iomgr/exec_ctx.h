@@ -29,10 +29,10 @@
 #include "src/core/lib/gprpp/fork.h"
 #include "src/core/lib/iomgr/closure.h"
 
-typedef gpr_atm grpc_millis;
+typedef int64_t grpc_millis;
 
-#define GRPC_MILLIS_INF_FUTURE GPR_ATM_MAX
-#define GRPC_MILLIS_INF_PAST GPR_ATM_MIN
+#define GRPC_MILLIS_INF_FUTURE INT64_MAX
+#define GRPC_MILLIS_INF_PAST INT64_MIN
 
 /** A workqueue represents a list of work to be executed asynchronously.
     Forward declared here to avoid a circular dependency with workqueue.h. */
@@ -45,6 +45,9 @@ typedef struct grpc_combiner grpc_combiner;
 /* The exec_ctx's thread is (potentially) owned by a call or channel: care
    should be given to not delete said call/channel from this exec_ctx */
 #define GRPC_EXEC_CTX_FLAG_THREAD_RESOURCE_LOOP 2
+/* This exec ctx was initialized by an internal thread, and should not
+   be counted by fork handlers */
+#define GRPC_EXEC_CTX_FLAG_IS_INTERNAL_THREAD 4
 
 extern grpc_closure_scheduler* grpc_schedule_on_exec_ctx;
 
@@ -93,7 +96,9 @@ class ExecCtx {
 
   /** Parameterised Constructor */
   ExecCtx(uintptr_t fl) : flags_(fl) {
-    grpc_core::Fork::IncExecCtxCount();
+    if (!(GRPC_EXEC_CTX_FLAG_IS_INTERNAL_THREAD & flags_)) {
+      grpc_core::Fork::IncExecCtxCount();
+    }
     Set(this);
   }
 
@@ -102,7 +107,9 @@ class ExecCtx {
     flags_ |= GRPC_EXEC_CTX_FLAG_IS_FINISHED;
     Flush();
     Set(last_exec_ctx_);
-    grpc_core::Fork::DecExecCtxCount();
+    if (!(GRPC_EXEC_CTX_FLAG_IS_INTERNAL_THREAD & flags_)) {
+      grpc_core::Fork::DecExecCtxCount();
+    }
   }
 
   /** Disallow copy and assignment operators */

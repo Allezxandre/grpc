@@ -19,6 +19,8 @@
 #ifndef TEST_QPS_CLIENT_H
 #define TEST_QPS_CLIENT_H
 
+#include <stdlib.h>
+
 #include <condition_variable>
 #include <mutex>
 #include <unordered_map>
@@ -34,6 +36,7 @@
 #include "src/proto/grpc/testing/benchmark_service.grpc.pb.h"
 #include "src/proto/grpc/testing/payloads.pb.h"
 
+#include "src/core/lib/gpr/env.h"
 #include "src/cpp/util/core_stats.h"
 #include "test/cpp/qps/histogram.h"
 #include "test/cpp/qps/interarrival.h"
@@ -441,16 +444,31 @@ class ClientImpl : public Client {
     std::unique_ptr<std::thread> WaitForReady() {
       return std::unique_ptr<std::thread>(new std::thread([this]() {
         if (!is_inproc_) {
-          GPR_ASSERT(channel_->WaitForConnected(
-              gpr_time_add(gpr_now(GPR_CLOCK_REALTIME),
-                           gpr_time_from_seconds(10, GPR_TIMESPAN))));
+          int connect_deadline = 10;
+          /* Allow optionally overriding connect_deadline in order
+           * to deal with benchmark environments in which the server
+           * can take a long time to become ready. */
+          char* channel_connect_timeout_str =
+              gpr_getenv("QPS_WORKER_CHANNEL_CONNECT_TIMEOUT");
+          if (channel_connect_timeout_str != nullptr &&
+              strcmp(channel_connect_timeout_str, "") != 0) {
+            connect_deadline = atoi(channel_connect_timeout_str);
+          }
+          gpr_log(GPR_INFO,
+                  "Waiting for up to %d seconds for the channel %p to connect",
+                  connect_deadline, channel_.get());
+          gpr_free(channel_connect_timeout_str);
+          GPR_ASSERT(channel_->WaitForConnected(gpr_time_add(
+              gpr_now(GPR_CLOCK_REALTIME),
+              gpr_time_from_seconds(connect_deadline, GPR_TIMESPAN))));
+          gpr_log(GPR_INFO, "Channel %p connected!", channel_.get());
         }
       }));
     }
 
    private:
     void set_channel_args(const ClientConfig& config, ChannelArguments* args) {
-      for (auto channel_arg : config.channel_args()) {
+      for (const auto& channel_arg : config.channel_args()) {
         if (channel_arg.value_case() == ChannelArg::kStrValue) {
           args->SetString(channel_arg.name(), channel_arg.str_value());
         } else if (channel_arg.value_case() == ChannelArg::kIntValue) {

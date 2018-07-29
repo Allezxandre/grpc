@@ -135,6 +135,8 @@ class GrpcLb : public LoadBalancingPolicy {
   void HandOffPendingPicksLocked(LoadBalancingPolicy* new_policy) override;
   void PingOneLocked(grpc_closure* on_initiate, grpc_closure* on_ack) override;
   void ExitIdleLocked() override;
+  void FillChildRefsForChannelz(ChildRefsList* child_subchannels,
+                                ChildRefsList* child_channels) override;
 
  private:
   /// Linked list of pending pick requests. It stores all information needed to
@@ -159,9 +161,8 @@ class GrpcLb : public LoadBalancingPolicy {
     // The LB token associated with the pick.  This is set via user_data in
     // the pick.
     grpc_mdelem lb_token;
-    // Stats for client-side load reporting. Note that this holds a
-    // reference, which must be either passed on via context or unreffed.
-    grpc_grpclb_client_stats* client_stats = nullptr;
+    // Stats for client-side load reporting.
+    RefCountedPtr<GrpcLbClientStats> client_stats;
     // Next pending pick.
     PendingPick* next = nullptr;
   };
@@ -186,7 +187,8 @@ class GrpcLb : public LoadBalancingPolicy {
 
     void StartQuery();
 
-    grpc_grpclb_client_stats* client_stats() const { return client_stats_; }
+    GrpcLbClientStats* client_stats() const { return client_stats_.get(); }
+
     bool seen_initial_response() const { return seen_initial_response_; }
 
    private:
@@ -237,7 +239,7 @@ class GrpcLb : public LoadBalancingPolicy {
 
     // The stats for client-side load reporting associated with this LB call.
     // Created after the first serverlist is received.
-    grpc_grpclb_client_stats* client_stats_ = nullptr;
+    RefCountedPtr<GrpcLbClientStats> client_stats_;
     grpc_millis client_stats_report_interval_ = 0;
     grpc_timer client_load_report_timer_;
     bool client_load_report_timer_callback_pending_ = false;
@@ -298,6 +300,9 @@ class GrpcLb : public LoadBalancingPolicy {
 
   // The channel for communicating with the LB server.
   grpc_channel* lb_channel_ = nullptr;
+  // Mutex to protect the channel to the LB server. This is used when
+  // processing a channelz request.
+  gpr_mu lb_channel_mu_;
   grpc_connectivity_state lb_channel_connectivity_;
   grpc_closure lb_channel_on_connectivity_changed_;
   // Are we already watching the LB channel's connectivity?
@@ -548,9 +553,6 @@ GrpcLb::BalancerCallState::~BalancerCallState() {
   grpc_byte_buffer_destroy(send_message_payload_);
   grpc_byte_buffer_destroy(recv_message_payload_);
   grpc_slice_unref_internal(lb_call_status_details_);
-  if (client_stats_ != nullptr) {
-    grpc_grpclb_client_stats_unref(client_stats_);
-  }
 }
 
 void GrpcLb::BalancerCallState::Orphan() {
@@ -673,22 +675,22 @@ void GrpcLb::BalancerCallState::MaybeSendClientLoadReportLocked(
 
 bool GrpcLb::BalancerCallState::LoadReportCountersAreZero(
     grpc_grpclb_request* request) {
-  grpc_grpclb_dropped_call_counts* drop_entries =
-      static_cast<grpc_grpclb_dropped_call_counts*>(
+  GrpcLbClientStats::DroppedCallCounts* drop_entries =
+      static_cast<GrpcLbClientStats::DroppedCallCounts*>(
           request->client_stats.calls_finished_with_drop.arg);
   return request->client_stats.num_calls_started == 0 &&
          request->client_stats.num_calls_finished == 0 &&
          request->client_stats.num_calls_finished_with_client_failed_to_send ==
              0 &&
          request->client_stats.num_calls_finished_known_received == 0 &&
-         (drop_entries == nullptr || drop_entries->num_entries == 0);
+         (drop_entries == nullptr || drop_entries->size() == 0);
 }
 
 void GrpcLb::BalancerCallState::SendClientLoadReportLocked() {
   // Construct message payload.
   GPR_ASSERT(send_message_payload_ == nullptr);
   grpc_grpclb_request* request =
-      grpc_grpclb_load_report_request_create_locked(client_stats_);
+      grpc_grpclb_load_report_request_create_locked(client_stats_.get());
   // Skip client load report if the counters were all zero in the last
   // report and they are still zero in this one.
   if (LoadReportCountersAreZero(request)) {
@@ -779,7 +781,7 @@ void GrpcLb::BalancerCallState::OnBalancerMessageReceivedLocked(
       if (grpc_lb_glb_trace.enabled()) {
         gpr_log(GPR_INFO,
                 "[grpclb %p] Received initial LB response message; "
-                "client load reporting interval = %" PRIdPTR " milliseconds",
+                "client load reporting interval = %" PRId64 " milliseconds",
                 grpclb_policy, lb_calld->client_stats_report_interval_);
       }
     } else if (grpc_lb_glb_trace.enabled()) {
@@ -814,7 +816,7 @@ void GrpcLb::BalancerCallState::OnBalancerMessageReceivedLocked(
       // serverlist returned from the current LB call.
       if (lb_calld->client_stats_report_interval_ > 0 &&
           lb_calld->client_stats_ == nullptr) {
-        lb_calld->client_stats_ = grpc_grpclb_client_stats_create();
+        lb_calld->client_stats_.reset(New<GrpcLbClientStats>());
         // TODO(roth): We currently track this ref manually.  Once the
         // ClosureRef API is ready, we should pass the RefCountedPtr<> along
         // with the callback.
@@ -1007,6 +1009,10 @@ grpc_channel_args* BuildBalancerChannelArgs(
       // A channel arg indicating the target is a grpclb load balancer.
       grpc_channel_arg_integer_create(
           const_cast<char*>(GRPC_ARG_ADDRESS_IS_GRPCLB_LOAD_BALANCER), 1),
+      // A channel arg indicating this is an internal channels, aka it is
+      // owned by components in Core, not by the user application.
+      grpc_channel_arg_integer_create(
+          const_cast<char*>(GRPC_ARG_CHANNELZ_CHANNEL_IS_INTERNAL_CHANNEL), 1),
   };
   // Construct channel args.
   grpc_channel_args* new_args = grpc_channel_args_copy_and_add_and_remove(
@@ -1036,6 +1042,7 @@ GrpcLb::GrpcLb(const grpc_lb_addresses* addresses,
               .set_max_backoff(GRPC_GRPCLB_RECONNECT_MAX_BACKOFF_SECONDS *
                                1000)) {
   // Initialization.
+  gpr_mu_init(&lb_channel_mu_);
   grpc_subchannel_index_ref();
   GRPC_CLOSURE_INIT(&lb_channel_on_connectivity_changed_,
                     &GrpcLb::OnBalancerChannelConnectivityChangedLocked, this,
@@ -1074,6 +1081,7 @@ GrpcLb::GrpcLb(const grpc_lb_addresses* addresses,
 GrpcLb::~GrpcLb() {
   GPR_ASSERT(pending_picks_ == nullptr);
   GPR_ASSERT(pending_pings_ == nullptr);
+  gpr_mu_destroy(&lb_channel_mu_);
   gpr_free((void*)server_name_);
   grpc_channel_args_destroy(args_);
   grpc_connectivity_state_destroy(&state_tracker_);
@@ -1103,8 +1111,10 @@ void GrpcLb::ShutdownLocked() {
   // OnBalancerChannelConnectivityChangedLocked(), and we need to be
   // alive when that callback is invoked.
   if (lb_channel_ != nullptr) {
+    gpr_mu_lock(&lb_channel_mu_);
     grpc_channel_destroy(lb_channel_);
     lb_channel_ = nullptr;
+    gpr_mu_unlock(&lb_channel_mu_);
   }
   grpc_connectivity_state_set(&state_tracker_, GRPC_CHANNEL_SHUTDOWN,
                               GRPC_ERROR_REF(error), "grpclb_shutdown");
@@ -1275,6 +1285,20 @@ void GrpcLb::PingOneLocked(grpc_closure* on_initiate, grpc_closure* on_ack) {
   }
 }
 
+void GrpcLb::FillChildRefsForChannelz(ChildRefsList* child_subchannels,
+                                      ChildRefsList* child_channels) {
+  // delegate to the RoundRobin to fill the children subchannels.
+  rr_policy_->FillChildRefsForChannelz(child_subchannels, child_channels);
+  mu_guard guard(&lb_channel_mu_);
+  if (lb_channel_ != nullptr) {
+    grpc_core::channelz::ChannelNode* channel_node =
+        grpc_channel_get_channelz_node(lb_channel_);
+    if (channel_node != nullptr) {
+      child_channels->push_back(channel_node->channel_uuid());
+    }
+  }
+}
+
 grpc_connectivity_state GrpcLb::CheckConnectivityLocked(
     grpc_error** connectivity_error) {
   return grpc_connectivity_state_get(&state_tracker_, connectivity_error);
@@ -1318,9 +1342,11 @@ void GrpcLb::ProcessChannelArgsLocked(const grpc_channel_args& args) {
   if (lb_channel_ == nullptr) {
     char* uri_str;
     gpr_asprintf(&uri_str, "fake:///%s", server_name_);
+    gpr_mu_lock(&lb_channel_mu_);
     lb_channel_ = grpc_client_channel_factory_create_channel(
         client_channel_factory(), uri_str,
         GRPC_CLIENT_CHANNEL_TYPE_LOAD_BALANCING, lb_channel_args);
+    gpr_mu_unlock(&lb_channel_mu_);
     GPR_ASSERT(lb_channel_ != nullptr);
     gpr_free(uri_str);
   }
@@ -1420,7 +1446,7 @@ void GrpcLb::StartBalancerCallRetryTimerLocked() {
     gpr_log(GPR_INFO, "[grpclb %p] Connection to LB server lost...", this);
     grpc_millis timeout = next_try - ExecCtx::Get()->Now();
     if (timeout > 0) {
-      gpr_log(GPR_INFO, "[grpclb %p] ... retry_timer_active in %" PRIuPTR "ms.",
+      gpr_log(GPR_INFO, "[grpclb %p] ... retry_timer_active in %" PRId64 "ms.",
               this, timeout);
     } else {
       gpr_log(GPR_INFO, "[grpclb %p] ... retry_timer_active immediately.",
@@ -1516,7 +1542,7 @@ grpc_error* AddLbTokenToInitialMetadata(
 
 // Destroy function used when embedding client stats in call context.
 void DestroyClientStats(void* arg) {
-  grpc_grpclb_client_stats_unref(static_cast<grpc_grpclb_client_stats*>(arg));
+  static_cast<GrpcLbClientStats*>(arg)->Unref();
 }
 
 void GrpcLb::PendingPickSetMetadataAndContext(PendingPick* pp) {
@@ -1537,14 +1563,12 @@ void GrpcLb::PendingPickSetMetadataAndContext(PendingPick* pp) {
     // Pass on client stats via context. Passes ownership of the reference.
     if (pp->client_stats != nullptr) {
       pp->pick->subchannel_call_context[GRPC_GRPCLB_CLIENT_STATS].value =
-          pp->client_stats;
+          pp->client_stats.release();
       pp->pick->subchannel_call_context[GRPC_GRPCLB_CLIENT_STATS].destroy =
           DestroyClientStats;
     }
   } else {
-    if (pp->client_stats != nullptr) {
-      grpc_grpclb_client_stats_unref(pp->client_stats);
-    }
+    pp->client_stats.reset();
   }
 }
 
@@ -1610,8 +1634,8 @@ bool GrpcLb::PickFromRoundRobinPolicyLocked(bool force_async, PendingPick* pp) {
       // subchannel call (and therefore no client_load_reporting filter)
       // for dropped calls.
       if (lb_calld_ != nullptr && lb_calld_->client_stats() != nullptr) {
-        grpc_grpclb_client_stats_add_call_dropped_locked(
-            server->load_balance_token, lb_calld_->client_stats());
+        lb_calld_->client_stats()->AddCallDroppedLocked(
+            server->load_balance_token);
       }
       if (force_async) {
         GRPC_CLOSURE_SCHED(pp->original_on_complete, GRPC_ERROR_NONE);
@@ -1624,7 +1648,7 @@ bool GrpcLb::PickFromRoundRobinPolicyLocked(bool force_async, PendingPick* pp) {
   }
   // Set client_stats and user_data.
   if (lb_calld_ != nullptr && lb_calld_->client_stats() != nullptr) {
-    pp->client_stats = grpc_grpclb_client_stats_ref(lb_calld_->client_stats());
+    pp->client_stats = lb_calld_->client_stats()->Ref();
   }
   GPR_ASSERT(pp->pick->user_data == nullptr);
   pp->pick->user_data = (void**)&pp->lb_token;
